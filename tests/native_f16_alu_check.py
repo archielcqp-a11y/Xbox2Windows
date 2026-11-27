@@ -2,7 +2,9 @@
 
 Each source contributes its low 16 bits. abs clears bit 15 of that half, then neg toggles it.
 The operation runs in f32 and rounds to binary16 the way v_cvt_f16_f32 does. The result is the low
-16 bits and the high half is zero. The reference is half_op in f16_packed_model.py (sub is an add of
+16 bits and the destination's high half keeps its value (LLVM GCNSubtarget::zeroesHigh16BitsOfDest:
+"On gfx10, all 16-bit instructions preserve the high bits"). Every destination holds HI_A in its high
+half before the operation, so each stored word is HI_A | result. The reference is half_op in f16_packed_model.py (sub is an add of
 the negated second source, subrev swaps the sources). NaN payloads are compared by class.
 
   native_f16_alu_check.py model
@@ -67,8 +69,9 @@ def modified(bits, abs_mask, neg, index):
 
 
 def same_half(got, want):
-    """Bit equality of two results. The high half must be zero. Any NaN matches any NaN."""
-    if (got | want) >> 16:
+    """Bit equality of two stored words: the high half must be the kept HI_A, the low halves equal. Any NaN
+    matches any NaN."""
+    if got >> 16 != HI_A >> 16 or want >> 16 not in (0, HI_A >> 16):
         return False
     left, right = got & 0xffff, want & 0xffff
     if M.is_nan(left) or M.is_nan(right):
@@ -218,12 +221,12 @@ def swapped_want(case):
 
 
 def reject_mutants(items):
-    """The comparator must fail a sub/subrev swap and a result whose high half was left in place."""
+    """The comparator must fail a sub/subrev swap and a result whose high half was zeroed."""
     wants = [case.want for case in items]
     swapped = [swapped_want(case) for case in items]
     assert any(left != right for left, right in zip(wants, swapped))
-    assert not all(same_half(got, want) for got, want in zip(swapped, wants))
-    assert not all(same_half(got | HI_A, want) for got, want in zip(wants, wants))
+    assert not all(same_half(HI_A | got, want) for got, want in zip(swapped, wants))
+    assert not any(same_half(got, want) for got, want in zip(wants, wants))
 
 
 def check_model(items):
@@ -241,7 +244,7 @@ def check_model(items):
         left = modified(case.a, case.abs_mask, case.neg, 0)
         right = modified(case.b, case.abs_mask, case.neg, 1)
         got = f32_half(case.op, left, right)
-        assert same_half(got, case.want), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
+        assert same_half(HI_A | got, case.want), (case.op, case.kind, hex(left), hex(right), hex(got), hex(case.want))
     wants = [case.want for case in items]
     assert 0x8000 in wants and 0x0000 in wants and 0x7c00 in wants and 0x3c00 in wants and 0x3c02 in wants
     assert any(M.is_nan(value) for value in wants)
@@ -505,7 +508,7 @@ def run_model():
     assert vop2(0x32, 0, 257, 2) == [0x64000501]
     assert len(want) == len(items) and len(code) > len(want)
     print('native_f16_alu model: %d results match f32-then-round; '
-          'a sub/subrev swap and a non-zero upper half are rejected' % len(items))
+          'a sub/subrev swap and a zeroed upper half are rejected' % len(items))
 
 
 def run_ir(dumper):
@@ -566,12 +569,12 @@ def run_gpu(gpu, sdk):
         bad = []
         for index, (got, model) in enumerate(zip(actual, expected)):
             # NaN payloads are not portable. Finite values and infinities match bit for bit,
-            # and every result has a zero upper half. Words outside the stores stay at the fill.
+            # and every result keeps HI_A in its upper half. Words outside the stores stay at the fill.
             ok = same_half(got, results[index]) if index in results else got == model
             if not ok:
                 bad.append((index, hex(got), hex(model)))
         assert not bad[:10], bad[:10]
-    print('native_f16_alu GPU: %d words matched the model, high half zero' % (GROUPS * len(want)))
+    print('native_f16_alu GPU: %d words matched the model, high half kept' % (GROUPS * len(want)))
 
 
 if __name__ == '__main__':

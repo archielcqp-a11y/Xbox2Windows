@@ -1087,7 +1087,11 @@ struct DirectCompute {
             // add, sub or mul (2*11+2). Round with the same integer nearest-even
             // conversion v_cvt_f16_f32 uses.
             auto rounded = packed_half_rne(bits);
-            vector_write(i.dst, i.subword ? place_subword(i, rounded) : ir.binary("and", rounded, "65535"));
+            // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest lists these four ops with
+            // "On gfx10, all 16-bit instructions preserve the high bits", as v_cvt_f16_f32 above already does.
+            vector_write(i.dst, i.subword ? place_subword(i, rounded)
+                                          : ir.binary("or", ir.binary("and", read(i.dst), "4294901760"),
+                                                      ir.binary("and", rounded, "65535")));
             return true;
         }
         const auto rule = alu_rules.find(n);
